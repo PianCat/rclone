@@ -1,0 +1,160 @@
+// Package api has type definitions for drime
+//
+// Converted from the API docs with help from https://mholt.github.io/json-to-go/
+package api
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
+
+// Types of things in Item
+const (
+	ItemTypeFolder = "folder"
+)
+
+type User struct {
+	Email            string      `json:"email"`
+	ID               json.Number `json:"id"`
+	Avatar           string      `json:"avatar"`
+	ModelType        string      `json:"model_type"`
+	OwnsEntry        bool        `json:"owns_entry"`
+	EntryPermissions []any       `json:"entry_permissions"`
+	DisplayName      string      `json:"display_name"`
+}
+
+type Permissions struct {
+	FilesUpdate   bool `json:"files.update"`
+	FilesCreate   bool `json:"files.create"`
+	FilesDownload bool `json:"files.download"`
+	FilesDelete   bool `json:"files.delete"`
+}
+
+// Item describes a folder or a file as returned by /drive/file-entries
+type Item struct {
+	ID           json.Number `json:"id"`
+	Name         string      `json:"name"`
+	Description  any         `json:"description"`
+	FileName     string      `json:"file_name"`
+	Mime         string      `json:"mime"`
+	Color        any         `json:"color"`
+	Backup       bool        `json:"backup"`
+	Tracked      int         `json:"tracked"`
+	FileSize     int64       `json:"file_size"`
+	UserID       json.Number `json:"user_id"`
+	ParentID     json.Number `json:"parent_id"`
+	CreatedAt    time.Time   `json:"created_at"`
+	UpdatedAt    time.Time   `json:"updated_at"`
+	DeletedAt    any         `json:"deleted_at"`
+	IsDeleted    int         `json:"is_deleted"`
+	Path         string      `json:"path"`
+	DiskPrefix   any         `json:"disk_prefix"`
+	Type         string      `json:"type"`
+	Extension    any         `json:"extension"`
+	FileHash     any         `json:"file_hash"`
+	Public       bool        `json:"public"`
+	Thumbnail    bool        `json:"thumbnail"`
+	MuxStatus    any         `json:"mux_status"`
+	ThumbnailURL any         `json:"thumbnail_url"`
+	WorkspaceID  int         `json:"workspace_id"`
+	IsEncrypted  int         `json:"is_encrypted"`
+	Iv           any         `json:"iv"`
+	VaultID      any         `json:"vault_id"`
+	OwnerID      int         `json:"owner_id"`
+	Hash         string      `json:"hash"`
+	URL          string      `json:"url"`
+	Users        []User      `json:"users"`
+	Tags         []any       `json:"tags"`
+	Permissions  Permissions `json:"permissions"`
+}
+
+type Listing struct {
+	CurrentPage int    `json:"current_page"`
+	Data        []Item `json:"data"`
+	From        int    `json:"from"`
+	LastPage    int    `json:"last_page"`
+	NextPage    int    `json:"next_page"`
+	PerPage     int    `json:"per_page"`
+	PrevPage    int    `json:"prev_page"`
+	To          int    `json:"to"`
+	Total       int    `json:"total"`
+}
+
+type UploadResponse struct {
+	Status    string `json:"status"`
+	FileEntry Item   `json:"fileEntry"`
+}
+
+type CreateFolderRequest struct {
+	Name     string      `json:"name"`
+	ParentID json.Number `json:"parentId,omitempty"`
+}
+
+type CreateFolderResponse struct {
+	Status string `json:"status"`
+	Folder Item   `json:"folder"`
+}
+
+// Error is returned from drime when things go wrong
+type Error struct {
+	Message string `json:"message"`
+}
+
+// Error returns a string for the error and satisfies the error interface
+func (e Error) Error() string {
+	out := fmt.Sprintf("Error %q", e.Message)
+	return out
+}
+
+// Check Error satisfies the error interface
+var _ error = (*Error)(nil)
+
+// DeleteRequest is the input to DELETE /file-entries
+type DeleteRequest struct {
+	EntryIds      []string `json:"entryIds"`
+	DeleteForever bool     `json:"deleteForever"`
+}
+
+// DeleteResponse is the input to DELETE /file-entries
+type DeleteResponse struct {
+	Status  string            `json:"status"`
+	Message string            `json:"message"`
+	Errors  map[string]string `json:"errors"`
+}
+
+// UpdateItemRequest describes the updates to be done to an item for PUT /file-entries/{id}/
+type UpdateItemRequest struct {
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+// UpdateItemResponse is returned by PUT /file-entries/{id}/
+type UpdateItemResponse struct {
+	Status    string `json:"status"`
+	FileEntry Item   `json:"fileEntry"`
+}
+
+// MoveRequest is the input to /file-entries/move
+type MoveRequest struct {
+	EntryIds      []string `json:"entryIds"`
+	DestinationID string   `json:"destinationId"`
+}
+
+// MoveResponse is returned by POST /file-entries/move
+type MoveResponse struct {
+	Status  string `json:"status"`
+	Entries []Item `json:"entries"`
+}
+
+// CopyRequest is the input to /file-entries/duplicate
+type CopyRequest struct {
+	EntryIds      []string `json:"entryIds"`
+	DestinationID string   `json:"destinationId"`
+}
+
+// CopyResponse is returned by POST /file-entries/duplicate
+type CopyResponse struct {
+	Status  string `json:"status"`
+	Entries []Item `json:"entries"`
+}
