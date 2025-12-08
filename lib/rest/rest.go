@@ -14,6 +14,7 @@ import (
 	"maps"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"sync"
 
@@ -145,6 +146,7 @@ type Opts struct {
 	MultipartMetadataName string       // ..this is used for the name of the metadata form part if set
 	MultipartContentName  string       // ..name of the parameter which is the attached file
 	MultipartFileName     string       // ..name of the file for the attached file
+	MultipartContentType  string       // ..content type of the attached file
 	Parameters            url.Values   // any parameters for the final URL
 	TransferEncoding      []string     // transfer encoding, set to "identity" to disable chunked encoding
 	Trailer               *http.Header // set the request trailer
@@ -371,6 +373,17 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 	return resp, nil
 }
 
+// CreateFormFile is a convenience wrapper around [Writer.CreatePart]. It creates
+// a new form-data header with the provided field name and file name.
+func CreateFormFile(w *multipart.Writer, fieldname, filename, contentType string) (io.Writer, error) {
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", multipart.FileContentDisposition(fieldname, filename))
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	return w.CreatePart(h)
+}
+
 // MultipartUpload creates an io.Reader which produces an encoded a
 // multipart form upload from the params passed in and the  passed in
 //
@@ -383,9 +396,25 @@ func (api *Client) Call(ctx context.Context, opts *Opts) (resp *http.Response, e
 //
 // NB This doesn't allow setting the content type of the attachment
 func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, contentName, fileName string) (io.ReadCloser, string, int64, error) {
+	return multipartUpload(ctx, in, params, contentName, fileName, "")
+}
+
+// multipartUpload creates an io.Reader which produces an encoded a
+// multipart form upload from the params passed in and the  passed in
+//
+// in - the body of the file (may be nil)
+// params - the form parameters
+// fileName - is the name of the attached file
+// contentName - the name of the parameter for the file
+// contentType - the content type for the upload
+//
+// the int64 returned is the overhead in addition to the file contents, in case Content-Length is required
+//
+// NB This doesn't allow setting the content type of the attachment
+func multipartUpload(ctx context.Context, in io.Reader, params url.Values, contentName, fileName, contentType string) (io.ReadCloser, string, int64, error) {
 	bodyReader, bodyWriter := io.Pipe()
 	writer := multipart.NewWriter(bodyWriter)
-	contentType := writer.FormDataContentType()
+	formContentType := writer.FormDataContentType()
 
 	// Create a Multipart Writer as base for calculating the Content-Length
 	buf := &bytes.Buffer{}
@@ -404,7 +433,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		}
 	}
 	if in != nil {
-		_, err = dummyMultipartWriter.CreateFormFile(contentName, fileName)
+		_, err = CreateFormFile(dummyMultipartWriter, contentName, fileName, contentType)
 		if err != nil {
 			return nil, "", 0, err
 		}
@@ -445,7 +474,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		}
 
 		if in != nil {
-			part, err := writer.CreateFormFile(contentName, fileName)
+			part, err := CreateFormFile(writer, contentName, fileName, contentType)
 			if err != nil {
 				_ = bodyWriter.CloseWithError(fmt.Errorf("failed to create form file: %w", err))
 				return
@@ -467,7 +496,7 @@ func MultipartUpload(ctx context.Context, in io.Reader, params url.Values, conte
 		_ = bodyWriter.Close()
 	}()
 
-	return bodyReader, contentType, multipartLength, nil
+	return bodyReader, formContentType, multipartLength, nil
 }
 
 // CallJSON runs Call and decodes the body as a JSON object into response (if not nil)
@@ -539,7 +568,7 @@ func (api *Client) callCodec(ctx context.Context, opts *Opts, request any, respo
 		opts = opts.Copy()
 
 		var overhead int64
-		opts.Body, opts.ContentType, overhead, err = MultipartUpload(ctx, opts.Body, params, opts.MultipartContentName, opts.MultipartFileName)
+		opts.Body, opts.ContentType, overhead, err = multipartUpload(ctx, opts.Body, params, opts.MultipartContentName, opts.MultipartFileName, opts.MultipartContentType)
 		if err != nil {
 			return nil, err
 		}
