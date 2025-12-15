@@ -158,3 +158,56 @@ type CopyResponse struct {
 	Status  string `json:"status"`
 	Entries []Item `json:"entries"`
 }
+
+// MultiPartCreateRequest is the input of POST /s3/multipart/create
+type MultiPartCreateRequest struct {
+	Filename  string `json:"filename"`
+	Mime      string `json:"mime"`
+	Size      int64  `json:"size"`
+	Extension string `json:"extension"`
+}
+
+// MultiPartCreateResponse is returned by POST /s3/multipart/create
+type MultiPartCreateResponse struct {
+	UploadID string `json:"uploadId"`
+	Key      string `json:"key"`
+}
+
+// CompletedPart Type for completed parts when making a multipart upload.
+type CompletedPart struct {
+	ETag       string `json:"ETag"`
+	PartNumber int32  `json:"PartNumber"`
+}
+
+// MultiPartGetURLsRequest is the input of POST /s3/multipart/batch-sign-part-urls
+type MultiPartGetURLsRequest struct {
+	UploadID    string `json:"uploadId"`
+	Key         string `json:"key"`
+	PartNumbers []int  `json:"partNumbers"`
+}
+
+// MultiPartGetURLsResponse is the result of POST /s3/multipart/batch-sign-part-urls
+type MultiPartGetURLsResponse struct {
+	URLs []struct {
+		URL        string `json:"url"`
+		PartNumber int32  `json:"partNumber"`
+	} `json:"urls"`
+}
+
+// MultiPartCompleteRequest is the input to POST /s3/multipart/complete
+type MultiPartCompleteRequest struct {
+	UploadID string          `json:"uploadId"`
+	Key      string          `json:"key"`
+	Parts    []CompletedPart `json:"parts"`
+}
+
+// MultiPartCompleteResponse is the result of POST /s3/multipart/complete
+type MultiPartCompleteResponse struct {
+	Location string `json:"location"`
+}
+
+// MultiPartAbort is the input of POST /s3/multipart/abort
+type MultiPartAbort struct {
+	UploadID string `json:"uploadId"`
+	Key      string `json:"key"`
+}
