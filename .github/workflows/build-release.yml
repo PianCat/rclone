@@ -52,14 +52,6 @@ jobs:
             -tags cmount \
             "${{ steps.ver.outputs.full }}"
 
-      - name: Build FreeBSD / NetBSD / OpenBSD / Plan9 / Solaris / AIX
-        run: |
-          go run bin/cross-compile.go \
-            -include '^(freebsd|netbsd|openbsd|plan9|solaris|aix)' \
-            -no-clean \
-            -compile-only \
-            "${{ steps.ver.outputs.full }}"
-
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -204,7 +196,7 @@ jobs:
             - **123open**: 官方 Open API 后端（OAuth2 Client Credentials）
 
             ### 支持的平台
-            Linux (amd64/386/arm/arm64/mips/mipsle) · macOS (amd64/arm64) · Windows (386/amd64/arm64) · FreeBSD · NetBSD · OpenBSD · Plan9 · Solaris · AIX
+            Linux (amd64/386/arm/arm64/mips/mipsle) · macOS (amd64/arm64) · Windows (386/amd64/arm64)
           draft: false
           prerelease: false
           files: |
