@@ -1,0 +1,47 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    - cron: '0 4 * * 1'  # 每周一凌晨 4:00 UTC
+  workflow_dispatch:      # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/rclone/rclone.git
+
+      - name: Fetch upstream
+        run: git fetch upstream --tags
+
+      - name: Rebase onto upstream
+        id: rebase
+        run: |
+          if git rebase upstream/master; then
+            echo "rebase_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "rebase_status=conflict" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Push if successful
+        if: steps.rebase.outputs.rebase_status == 'success'
+        run: git push --force-with-lease origin master
+
+      - name: Report conflict
+        if: steps.rebase.outputs.rebase_status == 'conflict'
+        run: |
+          echo "::warning::Merge conflict detected during sync. Manual resolution required."
+          git rebase --abort

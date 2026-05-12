@@ -1,0 +1,132 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'VERSION'
+      - 'bin/**'
+      - '.github/workflows/build-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            asset_name: rclone-linux-amd64
+
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            asset_name: rclone-macos-amd64
+
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            asset_name: rclone-macos-arm64
+
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            ext: .exe
+            asset_name: rclone-windows-amd64
+
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '~1.26.3'
+          check-latest: true
+
+      - name: Set version
+        id: version
+        shell: bash
+        run: |
+          UPSTREAM_VER=$(cat VERSION)
+          COMMIT_HASH=$(git rev-parse --short=8 HEAD)
+          FULL_VER="${UPSTREAM_VER}-${COMMIT_HASH}"
+          echo "full_version=${FULL_VER}" >> $GITHUB_OUTPUT
+          echo "upstream_version=${UPSTREAM_VER}" >> $GITHUB_OUTPUT
+
+      - name: Build
+        shell: bash
+        run: |
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags="-s -w -X github.com/rclone/rclone/fs.Version=${{ steps.version.outputs.full_version }}" \
+            -o ${{ matrix.asset_name }}${{ matrix.ext }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}${{ matrix.ext }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set version
+        id: version
+        run: |
+          UPSTREAM_VER=$(cat VERSION)
+          COMMIT_HASH=$(git rev-parse --short=8 HEAD)
+          FULL_VER="${UPSTREAM_VER}-${COMMIT_HASH}"
+          echo "full_version=${FULL_VER}" >> $GITHUB_OUTPUT
+          echo "upstream_version=${UPSTREAM_VER}" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.full_version }}
+          name: ${{ steps.version.outputs.full_version }}
+          body: |
+            ## Rclone with 123Pan ${{ steps.version.outputs.full_version }}
+
+            基于上游版本 `${{ steps.version.outputs.upstream_version }}`，包含以下增强：
+
+            - **123pan**: Web/浏览器 API 后端（用户名密码登录）
+            - **123open**: 官方 Open API 后端（开发者凭证）
+
+            构建自 commit: `${{ github.sha }}`
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/rclone-linux-amd64/rclone-linux-amd64
+            artifacts/rclone-macos-amd64/rclone-macos-amd64
+            artifacts/rclone-macos-arm64/rclone-macos-arm64
+            artifacts/rclone-windows-amd64/rclone-windows-amd64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
