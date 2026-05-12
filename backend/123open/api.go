@@ -1,4 +1,4 @@
-package pan123
+package open123
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rclone/rclone/backend/123pan/api"
+	"github.com/rclone/rclone/backend/123open/api"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/lib/pacer"
