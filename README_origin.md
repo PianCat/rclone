@@ -9,32 +9,19 @@
 [Contributing](CONTRIBUTING.md) |
 [Changelog](https://rclone.org/changelog/) |
 [Installation](https://rclone.org/install/) |
-[Forum](https://forum.rclone.org/) |
-[Origin Docs](README_origin.md)
+[Forum](https://forum.rclone.org/)
 
 [![Build Status](https://github.com/rclone/rclone/workflows/build/badge.svg)](https://github.com/rclone/rclone/actions?query=workflow%3Abuild)
 [![Go Report Card](https://goreportcard.com/badge/github.com/rclone/rclone)](https://goreportcard.com/report/github.com/rclone/rclone)
 [![GoDoc](https://godoc.org/github.com/rclone/rclone?status.svg)](https://godoc.org/github.com/rclone/rclone)
 [![Docker Pulls](https://img.shields.io/docker/pulls/rclone/rclone)](https://hub.docker.com/r/rclone/rclone)
 
-# Rclone with 123Pan（123网盘增强版）
+# Rclone with 123Pan
 
-Rclone *（"云存储的 rsync"）* 是一个命令行程序，用于在不同云存储提供商之间同步文件和目录。
+Rclone *("rsync for cloud storage")* is a command-line program to sync files and
+directories to and from different cloud storage providers.
 
-## 123Pan 特别功能
-
-此 Fork 版本新增了两个 123 云存储后端：
-
-- `123pan` — 基于 Web/浏览器 API 逆向工程的后端（支持用户名/密码登录，无需开发者凭证）
-- `123open` — 官方 Open API 后端（使用 OAuth2 Client Credentials，面向开发者，申请地址：https://www.123pan.com/developer）
-
-两者均支持：文件列表、上传/下载、目录操作、移动/重命名、秒传、MD5 哈希、存储配额查询。
-
-`123open` 额外支持：服务端复制、生成公开分享链接、回收站清理。
-
-> 注意：两个后端均不支持设置修改时间，且不能上传空文件（0 字节）。
-
-## 存储提供商
+## Storage providers
 
 - 123 Cloud Storage [:page_facing_up:](https://rclone.org/123pan/)
 - 123 Cloud Open Storage [:page_facing_up:](https://rclone.org/123open/)
@@ -150,55 +137,61 @@ Rclone *（"云存储的 rsync"）* 是一个命令行程序，用于在不同�
 - Zata.ai [:page_facing_up:](https://rclone.org/s3/#Zata)
 - The local filesystem [:page_facing_up:](https://rclone.org/local/)
 
-请参阅[所有存储提供商及其功能的完整列表](https://rclone.org/overview/)
+Please see [the full list of all storage providers and their features](https://rclone.org/overview/)
 
-### 虚拟存储提供商
+### Virtual storage providers
 
-这些后端适配或修改其他存储提供商：
+These backends adapt or modify other storage providers
 
-- Alias: 重命名现有远程存储 [:page_facing_up:](https://rclone.org/alias/)
-- Archive: 读取归档文件 [:page_facing_up:](https://rclone.org/archive/)
-- Cache: 缓存远程存储（已弃用） [:page_facing_up:](https://rclone.org/cache/)
-- Chunker: 分割大文件 [:page_facing_up:](https://rclone.org/chunker/)
-- Combine: 将多个远程存储组合成目录树 [:page_facing_up:](https://rclone.org/combine/)
-- Compress: 压缩文件 [:page_facing_up:](https://rclone.org/compress/)
-- Crypt: 加密文件 [:page_facing_up:](https://rclone.org/crypt/)
-- Hasher: 哈希文件 [:page_facing_up:](https://rclone.org/hasher/)
-- Union: 将多个远程存储联合使用 [:page_facing_up:](https://rclone.org/union/)
+- Alias: rename existing remotes [:page_facing_up:](https://rclone.org/alias/)
+- Archive: read archive files [:page_facing_up:](https://rclone.org/archive/)
+- Cache: cache remotes (DEPRECATED) [:page_facing_up:](https://rclone.org/cache/)
+- Chunker: split large files [:page_facing_up:](https://rclone.org/chunker/)
+- Combine: combine multiple remotes into a directory tree [:page_facing_up:](https://rclone.org/combine/)
+- Compress: compress files [:page_facing_up:](https://rclone.org/compress/)
+- Crypt: encrypt files [:page_facing_up:](https://rclone.org/crypt/)
+- Hasher: hash files [:page_facing_up:](https://rclone.org/hasher/)
+- Union: join multiple remotes to work together [:page_facing_up:](https://rclone.org/union/)
 
-## 功能特性
+## Features
 
-- 始终检查 MD5/SHA-1 哈希以确保文件完整性
-- 保留文件时间戳
-- 支持基于完整文件的部分同步
-- [复制](https://rclone.org/commands/rclone_copy/)模式：仅复制新增/变更的文件
-- [同步](https://rclone.org/commands/rclone_sync/)（单向）模式：使目标目录与源目录完全一致
-- [双向同步](https://rclone.org/bisync/)：双向保持两个目录同步
-- [校验](https://rclone.org/commands/rclone_check/)模式：检查文件哈希是否一致
-- 支持与网络之间的同步，例如两个不同的云账户
-- 可选的大文件分块（[Chunker](https://rclone.org/chunker/)）
-- 可选的透明压缩（[Compress](https://rclone.org/compress/)）
-- 可选的加密（[Crypt](https://rclone.org/crypt/)）
-- 可选的 FUSE 挂载（[rclone mount](https://rclone.org/commands/rclone_mount/)）
-- 多线程下载到本地磁盘
-- 可通过 HTTP/WebDAV/FTP/SFTP/DLNA [提供](https://rclone.org/commands/rclone_serve/)本地或远程文件服务
+- MD5/SHA-1 hashes checked at all times for file integrity
+- Timestamps preserved on files
+- Partial syncs supported on a whole file basis
+- [Copy](https://rclone.org/commands/rclone_copy/) mode to just copy new/changed
+  files
+- [Sync](https://rclone.org/commands/rclone_sync/) (one way) mode to make a directory
+  identical
+- [Bisync](https://rclone.org/bisync/) (two way) to keep two directories in sync
+  bidirectionally
+- [Check](https://rclone.org/commands/rclone_check/) mode to check for file hash
+  equality
+- Can sync to and from network, e.g. two different cloud accounts
+- Optional large file chunking ([Chunker](https://rclone.org/chunker/))
+- Optional transparent compression ([Compress](https://rclone.org/compress/))
+- Optional encryption ([Crypt](https://rclone.org/crypt/))
+- Optional FUSE mount ([rclone mount](https://rclone.org/commands/rclone_mount/))
+- Multi-threaded downloads to local disk
+- Can [serve](https://rclone.org/commands/rclone_serve/) local or remote files
+  over HTTP/WebDAV/FTP/SFTP/DLNA
 
-## 安装与文档
+## Installation & documentation
 
-请访问 [rclone 官网](https://rclone.org/)获取：
+Please see the [rclone website](https://rclone.org/) for:
 
-- [安装](https://rclone.org/install/)
-- [文档与配置](https://rclone.org/docs/)
-- [更新日志](https://rclone.org/changelog/)
-- [常见问题](https://rclone.org/faq/)
-- [存储提供商](https://rclone.org/overview/)
-- [论坛](https://forum.rclone.org/)
-- ……以及更多内容
+- [Installation](https://rclone.org/install/)
+- [Documentation & configuration](https://rclone.org/docs/)
+- [Changelog](https://rclone.org/changelog/)
+- [FAQ](https://rclone.org/faq/)
+- [Storage providers](https://rclone.org/overview/)
+- [Forum](https://forum.rclone.org/)
+- ...and more
 
-## 下载
+## Downloads
 
 - <https://rclone.org/downloads/>
 
-## 许可协议
+## License
 
-本软件基于 MIT 许可证条款免费提供（请查看本软件包中包含的 [COPYING 文件](/COPYING)）。
+This is free software under the terms of the MIT license (check the
+[COPYING file](/COPYING) included in this package).
