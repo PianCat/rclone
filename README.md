@@ -23,7 +23,8 @@ directories to and from different cloud storage providers.
 
 ## Storage providers
 
-- 123Cloud Storage [:page_facing_up:](https://rclone.org/123pan/)
+- 123 Cloud Storage [:page_facing_up:](https://rclone.org/123pan/)
+- 123 Cloud Open Storage [:page_facing_up:](https://rclone.org/123open/)
 - 1Fichier [:page_facing_up:](https://rclone.org/fichier/)
 - Akamai Netstorage [:page_facing_up:](https://rclone.org/netstorage/)
 - Alibaba Cloud (Aliyun) Object Storage System (OSS) [:page_facing_up:](https://rclone.org/s3/#alibaba-oss)

@@ -1,12 +1,14 @@
-// Package pan123 provides an interface to the 123Pan cloud storage system.
 package pan123
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -24,70 +26,54 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/time/rate"
 )
 
 const (
-	apiBaseURL     = "https://open-api.123pan.com"
-	rootID         = "0"
-	minSleep       = 200 * time.Millisecond
-	maxSleep       = 5 * time.Second
-	trashBatchSize = 100 // Maximum files per trash API call
+	rootID          = "0"
+	minSleep        = 200 * time.Millisecond
+	maxSleep        = 5 * time.Second
+	rateInterval    = 700 * time.Millisecond
+	trashBatchSize  = 100
+	maxAPIRetries   = 10
+	baseRetryDelay  = time.Second
+	maxRetryDelay   = 30 * time.Second
 )
 
-// parseID converts a string directory ID to int64
-func parseID(id string) (int64, error) {
-	return strconv.ParseInt(id, 10, 64)
-}
-
-// formatID converts an int64 ID to string
-func formatID(id int64) string {
-	return strconv.FormatInt(id, 10)
-}
-
-// Register with Fs
 func init() {
 	fs.Register(&fs.RegInfo{
 		Name:        "123pan",
-		Description: "123Pan (123 Cloud Storage)",
+		Description: "123 Pan (Web API)",
 		NewFs:       NewFs,
 		Options: []fs.Option{
 			{
-				Name:      "client_id",
-				Help:      "Client ID from 123pan developer console.\n\nGet it from https://www.123pan.com/developer",
+				Name:      "username",
+				Help:      "123 Pan login username or email.",
 				Required:  true,
 				Sensitive: true,
 			},
 			{
-				Name:      "client_secret",
-				Help:      "Client Secret from 123pan developer console.\n\nGet it from https://www.123pan.com/developer",
+				Name:      "password",
+				Help:      "123 Pan login password.",
 				Required:  true,
 				Sensitive: true,
 			},
 			{
-				Name:      "access_token",
-				Help:      "Access token (optional, will be auto-refreshed).",
-				Advanced:  true,
-				Sensitive: true,
-				Hide:      fs.OptionHideBoth,
+				Name:     "upload_thread",
+				Help:     "Number of concurrent threads for chunked uploads.",
+				Default:  4,
+				Advanced: true,
 			},
 			{
-				Name:     "token_expiry",
-				Help:     "Token expiry time (auto-managed).",
+				Name:     "platform",
+				Help:     "Platform identifier sent in API headers.",
+				Default:  "web",
 				Advanced: true,
-				Hide:     fs.OptionHideBoth,
-			},
-			{
-				Name:     "vip_level",
-				Help:     "Cached VIP level (auto-managed). -1 means not cached.",
-				Advanced: true,
-				Hide:     fs.OptionHideBoth,
-				Default:  -1,
 			},
 			{
 				Name:     config.ConfigEncoding,
 				Help:     config.ConfigEncodingHelp,
 				Advanced: true,
-				// Encoding is identical to OneDrive
 				Default: (encoder.Display |
 					encoder.EncodeBackSlash |
 					encoder.EncodeLeftSpace |
@@ -103,136 +89,428 @@ func init() {
 
 // Options defines the configuration for this backend
 type Options struct {
-	ClientID     string               `config:"client_id"`
-	ClientSecret string               `config:"client_secret"`
-	AccessToken  string               `config:"access_token"`
-	TokenExpiry  string               `config:"token_expiry"`
-	VipLevel     int                  `config:"vip_level"`
+	Username     string               `config:"username"`
+	Password     string               `config:"password"`
+	UploadThread int                  `config:"upload_thread"`
+	Platform     string               `config:"platform"`
 	Enc          encoder.MultiEncoder `config:"encoding"`
 }
 
-// QPSLimits defines rate limits for different APIs
-// See: https://123yunpan.yuque.com/org-wiki-123yunpan-muaork/cr6ced/txgcvbfgh0gtuad5
-type QPSLimits struct {
-	FileList       int // api/v2/file/list
-	FileMove       int // api/v1/file/move
-	FileTrash      int // api/v1/file/trash
-	FileDelete     int // api/v1/file/delete (permanent delete)
-	Mkdir          int // upload/v1/file/mkdir
-	DownloadInfo   int // api/v1/file/download_info
-	UploadCreate   int // upload/v2/file/create
-	UploadComplete int // upload/v2/file/upload_complete
-	FileRename     int // api/v1/file/name
-	ShareCreate    int // api/v1/share/create
-}
-
-const unlimitedQPS = 100 // Use high value for "unlimited" APIs
-
-var (
-	// Rate limits for free users (Developer API mode)
-	// Documented: api/v2/file/list=5, file/move=3, file/delete=1, mkdir=5
-	// Customer service confirmed: upload_complete=5, create=1, download_info=2
-	// Unlimited: file/name, share/create, file/trash
-	freeUserQPS = QPSLimits{
-		FileList:       5,            // documented
-		FileMove:       3,            // documented
-		FileTrash:      unlimitedQPS, // confirmed unlimited
-		FileDelete:     1,            // documented
-		Mkdir:          5,            // documented
-		DownloadInfo:   2,            // confirmed: 2 QPS
-		UploadCreate:   1,            // confirmed: 1 QPS
-		UploadComplete: 5,            // confirmed: 5 QPS
-		FileRename:     unlimitedQPS, // confirmed unlimited
-		ShareCreate:    unlimitedQPS, // confirmed unlimited
-	}
-	// Rate limits for VIP users (Developer API mode)
-	// Documented: api/v2/file/list=10, file/move=10, file/delete=10, mkdir=20
-	// Customer service confirmed: upload_complete=20, create=20, download_info=unlimited
-	// Unlimited: file/name, share/create, file/trash
-	vipUserQPS = QPSLimits{
-		FileList:       10,           // documented
-		FileMove:       10,           // documented
-		FileTrash:      unlimitedQPS, // confirmed unlimited
-		FileDelete:     10,           // documented
-		Mkdir:          20,           // documented
-		DownloadInfo:   unlimitedQPS, // confirmed unlimited
-		UploadCreate:   20,           // confirmed: 20 QPS
-		UploadComplete: 20,           // confirmed: 20 QPS
-		FileRename:     unlimitedQPS, // confirmed unlimited
-		ShareCreate:    unlimitedQPS, // confirmed unlimited
-	}
-)
-
-// Fs represents a remote 123pan server
+// Fs represents a remote 123Pan Web API server
 type Fs struct {
-	name             string               // name of this remote
-	root             string               // the path we are working on
-	opt              Options              // parsed options
-	features         *fs.Features         // optional features
-	srv              *rest.Client         // the connection to the server
-	dirCache         *dircache.DirCache   // Map of directory path to directory id
-	pacer            *fs.Pacer            // pacer for API calls
-	m                configmap.Mapper     // config map for saving tokens
-	tokenMu          *sync.Mutex          // mutex for token refresh
-	tokenExpiry      time.Time            // token expiration time
-	tokenJustRefresh bool                 // flag to indicate token was just refreshed
-	vipRefreshed     bool                 // flag to indicate VIP level was refreshed due to 429
-	uid              uint64               // user ID
-	isVip            bool                 // whether user is VIP
-	vipLevel         int                  // VIP level: 0=free, 1=VIP, 2=SVIP, 3=长期VIP
-	qpsLimits        QPSLimits            // current QPS limits
-	apiPacers        map[string]*fs.Pacer // per-API pacers
-	sliceHTTPClient  *http.Client         // reusable HTTP client for slice uploads
+	name             string
+	root             string
+	opt              Options
+	features         *fs.Features
+	srv              *rest.Client
+	dirCache         *dircache.DirCache
+	pacer            *fs.Pacer
+	m                configmap.Mapper
+	accessToken      string
+	apiLimiter       *sync.Map
+	httpClient       *http.Client // for download requests
+	noRedirectClient *http.Client // for download redirect detection
 }
 
-// Object describes a 123pan object
+// Object describes a 123Pan object
 type Object struct {
-	fs          *Fs       // what this object is part of
-	remote      string    // The remote path
-	hasMetaData bool      // whether info below has been set
-	size        int64     // size of the object
-	modTime     time.Time // modification time of the object
-	id          int64     // ID of the object
-	etag        string    // MD5 hash
-	parentID    int64     // parent directory ID
+	fs          *Fs
+	remote      string
+	hasMetaData bool
+	size        int64
+	modTime     time.Time
+	id          int64
+	etag        string
+	s3KeyFlag   string
+	parentID    int64
+}
+
+// ------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------
+
+func parseID(id string) (int64, error) {
+	return strconv.ParseInt(id, 10, 64)
+}
+
+func formatID(id int64) string {
+	return strconv.FormatInt(id, 10)
+}
+
+func calculateRetryDelay(attempt int, baseDelay, maxDelay time.Duration) time.Duration {
+	delay := baseDelay * time.Duration(1<<uint(attempt))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+	return delay
+}
+
+// ------------------------------------------------------------
+// Rate limiting
+// ------------------------------------------------------------
+
+func (f *Fs) getLimiter(key string) *rate.Limiter {
+	if v, ok := f.apiLimiter.Load(key); ok {
+		return v.(*rate.Limiter)
+	}
+	lim := rate.NewLimiter(rate.Every(rateInterval), 1)
+	actual, _ := f.apiLimiter.LoadOrStore(key, lim)
+	return actual.(*rate.Limiter)
+}
+
+// ------------------------------------------------------------
+// API helpers
+// ------------------------------------------------------------
+
+func (f *Fs) signURL(rawURL string) string {
+	return api.GetAPI(rawURL)
+}
+
+func (f *Fs) setHeaders(opts *rest.Opts) {
+	opts.ExtraHeaders = map[string]string{
+		"Authorization": "Bearer " + f.accessToken,
+		"platform":      f.opt.Platform,
+		"app-version":   "3",
+		"origin":        "https://www.123pan.com",
+		"referer":       "https://www.123pan.com/",
+		"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) rclone-123pan",
+	}
+}
+
+func (f *Fs) callJSON(ctx context.Context, method, rawURL string, request interface{}) error {
+	lim := f.getLimiter(rawURL)
+	if err := lim.Wait(ctx); err != nil {
+		return err
+	}
+
+	rootURL := f.signURL(rawURL)
+	opts := rest.Opts{
+		Method:  method,
+		RootURL: rootURL,
+	}
+	f.setHeaders(&opts)
+
+	var resp api.BaseResponse
+	err := f.pacer.Call(func() (bool, error) {
+		httpResp, err := f.srv.CallJSON(ctx, &opts, request, &resp)
+		return shouldRetry(ctx, httpResp, err)
+	})
+	if err != nil {
+		return err
+	}
+
+	if resp.Code == 401 {
+		token, loginErr := f.signIn(ctx)
+		if loginErr != nil {
+			return loginErr
+		}
+		f.accessToken = token
+		f.setHeaders(&opts)
+
+		var resp2 api.BaseResponse
+		err = f.pacer.Call(func() (bool, error) {
+			httpResp, err := f.srv.CallJSON(ctx, &opts, request, &resp2)
+			return shouldRetry(ctx, httpResp, err)
+		})
+		if err != nil {
+			return err
+		}
+		if resp2.Code != 0 {
+			return fmt.Errorf("API error: %s (code %d)", resp2.Message, resp2.Code)
+		}
+		return nil
+	}
+
+	if resp.Code != 0 {
+		return fmt.Errorf("API error: %s (code %d)", resp.Message, resp.Code)
+	}
+
+	return nil
+}
+
+func (f *Fs) callJSONDecode(ctx context.Context, method, rawURL string, request, response interface{}) error {
+	lim := f.getLimiter(rawURL)
+	if err := lim.Wait(ctx); err != nil {
+		return err
+	}
+
+	rootURL := f.signURL(rawURL)
+	opts := rest.Opts{
+		Method:  method,
+		RootURL: rootURL,
+	}
+	f.setHeaders(&opts)
+
+	err := f.pacer.Call(func() (bool, error) {
+		httpResp, err := f.srv.CallJSON(ctx, &opts, request, response)
+		return shouldRetry(ctx, httpResp, err)
+	})
+	if err != nil {
+		return err
+	}
+
+	if r, ok := response.(api.Response); ok && r.GetCode() == 401 {
+		token, loginErr := f.signIn(ctx)
+		if loginErr != nil {
+			return loginErr
+		}
+		f.accessToken = token
+		f.setHeaders(&opts)
+
+		err = f.pacer.Call(func() (bool, error) {
+			httpResp, err := f.srv.CallJSON(ctx, &opts, request, response)
+			return shouldRetry(ctx, httpResp, err)
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (f *Fs) signIn(ctx context.Context) (string, error) {
+	var request map[string]interface{}
+
+	if strings.Contains(f.opt.Username, "@") {
+		request = map[string]interface{}{
+			"mail":     f.opt.Username,
+			"password": f.opt.Password,
+			"type":     2,
+		}
+	} else {
+		request = map[string]interface{}{
+			"passport": f.opt.Username,
+			"password": f.opt.Password,
+			"remember": true,
+		}
+	}
+
+	rootURL := api.SignIn
+	opts := rest.Opts{
+		Method:  "POST",
+		RootURL: rootURL,
+		ExtraHeaders: map[string]string{
+			"origin":      "https://www.123pan.com",
+			"referer":     "https://www.123pan.com/",
+			"platform":    f.opt.Platform,
+			"app-version": "3",
+			"user-agent":  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) rclone-123pan",
+		},
+	}
+
+	var resp api.SignInResponse
+	err := f.pacer.Call(func() (bool, error) {
+		httpResp, err := f.srv.CallJSON(ctx, &opts, request, &resp)
+		return shouldRetry(ctx, httpResp, err)
+	})
+	if err != nil {
+		return "", fmt.Errorf("sign in failed: %w", err)
+	}
+
+	if resp.Code != 200 {
+		return "", fmt.Errorf("sign in error: %s (code %d)", resp.Message, resp.Code)
+	}
+
+	return resp.Data.Token, nil
+}
+
+func (f *Fs) userInfo(ctx context.Context) (*api.UserInfoResponse, error) {
+	var resp api.UserInfoResponse
+	err := f.callJSONDecode(ctx, "GET", api.UserInfo, nil, &resp)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("user info error: %s (code %d)", resp.Message, resp.Code)
+	}
+	return &resp, nil
+}
+
+func (f *Fs) listFiles(ctx context.Context, parentID int64, page int) (*api.FileListResponse, error) {
+	lim := f.getLimiter("file_list")
+	if err := lim.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	params := fmt.Sprintf("driveId=0&limit=100&next=0&orderBy=file_id&orderDirection=desc&parentFileId=%d&trashed=false&SearchData=&OnlyLookAbnormalFile=0&event=homeListFile&operateType=4&inDirectSpace=false&Page=%d", parentID, page)
+	u := f.signURL(api.FileList + "?" + params)
+
+	opts := rest.Opts{
+		Method:  "GET",
+		RootURL: u,
+	}
+	f.setHeaders(&opts)
+
+	var resp api.FileListResponse
+	err := f.pacer.Call(func() (bool, error) {
+		httpResp, err := f.srv.CallJSON(ctx, &opts, nil, &resp)
+		return shouldRetry(ctx, httpResp, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("list files error: %s (code %d)", resp.Message, resp.Code)
+	}
+	return &resp, nil
+}
+
+func (f *Fs) forEachFile(ctx context.Context, parentID int64, fn func(file api.File) (stop bool)) error {
+	page := 1
+	for {
+		resp, err := f.listFiles(ctx, parentID, page)
+		if err != nil {
+			return err
+		}
+		for _, file := range resp.Data.InfoList {
+			if fn(file) {
+				return nil
+			}
+		}
+		if resp.Data.Next == "-1" {
+			return nil
+		}
+		page++
+	}
+}
+
+func (f *Fs) downloadInfo(ctx context.Context, fileID int64, etag, s3KeyFlag, fileName string, size int64, fileType int) (*api.DownloadInfoResponse, error) {
+	request := map[string]interface{}{
+		"driveId":   0,
+		"etag":      etag,
+		"fileId":    fileID,
+		"fileName":  fileName,
+		"s3keyFlag": s3KeyFlag,
+		"size":      size,
+		"type":      fileType,
+	}
+
+	var resp api.DownloadInfoResponse
+	err := f.callJSONDecode(ctx, "POST", api.DownloadInfo, request, &resp)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("download info error: %s (code %d)", resp.Message, resp.Code)
+	}
+	return &resp, nil
+}
+
+func (f *Fs) mkdir(ctx context.Context, parentID int64, name string) (int64, error) {
+	request := map[string]interface{}{
+		"driveId":      0,
+		"etag":         "",
+		"fileName":     name,
+		"parentFileId": parentID,
+		"size":         0,
+		"type":         1,
+	}
+
+	var resp api.UploadRequestResponse
+	err := f.callJSONDecode(ctx, "POST", api.Mkdir, request, &resp)
+	if err != nil {
+		return 0, err
+	}
+	if resp.Code != 0 {
+		return 0, fmt.Errorf("mkdir error: %s (code %d)", resp.Message, resp.Code)
+	}
+	return resp.Data.FileID, nil
+}
+
+func (f *Fs) move(ctx context.Context, fileID, toParentID int64) error {
+	request := map[string]interface{}{
+		"fileIdList":   []map[string]int64{{"FileId": fileID}},
+		"parentFileId": toParentID,
+	}
+
+	return f.callJSON(ctx, "POST", api.Move, request)
+}
+
+func (f *Fs) rename(ctx context.Context, fileID int64, newName string) error {
+	request := map[string]interface{}{
+		"driveId":  0,
+		"fileId":   fileID,
+		"fileName": newName,
+	}
+
+	return f.callJSON(ctx, "POST", api.Rename, request)
+}
+
+func (f *Fs) trash(ctx context.Context, fileIDs []int64) error {
+	if len(fileIDs) == 0 {
+		return nil
+	}
+
+	type trashInfo struct {
+		FileID      int64  `json:"FileId"`
+		FileName    string `json:"FileName"`
+		Size        int64  `json:"Size"`
+		Type        int    `json:"Type"`
+		Etag        string `json:"Etag"`
+		S3KeyFlag   string `json:"S3KeyFlag"`
+		DownloadURL string `json:"DownloadUrl"`
+	}
+	infos := make([]trashInfo, len(fileIDs))
+	for i, id := range fileIDs {
+		infos[i] = trashInfo{FileID: id}
+	}
+
+	request := map[string]interface{}{
+		"driveId":           0,
+		"operation":         true,
+		"fileTrashInfoList": infos,
+	}
+
+	return f.callJSON(ctx, "POST", api.Trash, request)
+}
+
+func (f *Fs) trashSingle(ctx context.Context, fileID int64) error {
+	return f.trash(ctx, []int64{fileID})
+}
+
+func (f *Fs) trashBatch(ctx context.Context, fileIDs []int64) error {
+	for i := 0; i < len(fileIDs); i += trashBatchSize {
+		end := i + trashBatchSize
+		if end > len(fileIDs) {
+			end = len(fileIDs)
+		}
+		if err := f.trash(ctx, fileIDs[i:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ------------------------------------------------------------
 // Fs interface methods
 // ------------------------------------------------------------
 
-// Name of the remote (as passed into NewFs)
 func (f *Fs) Name() string {
 	return f.name
 }
 
-// Root of the remote (as passed into NewFs)
 func (f *Fs) Root() string {
 	return f.root
 }
 
-// String converts this Fs to a string
 func (f *Fs) String() string {
 	return fmt.Sprintf("123pan root '%s'", f.root)
 }
 
-// Features returns the optional features of this Fs
 func (f *Fs) Features() *fs.Features {
 	return f.features
 }
 
-// Precision returns the precision of the remote
-// 123pan doesn't support setting modification times, so return ModTimeNotSupported
 func (f *Fs) Precision() time.Duration {
 	return fs.ModTimeNotSupported
 }
 
-// Hashes returns the supported hash sets
 func (f *Fs) Hashes() hash.Set {
 	return hash.Set(hash.MD5)
 }
 
-// NewFs constructs an Fs from the path, bucket:path
+// NewFs constructs an Fs from the path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	opt := new(Options)
 	err := configstruct.Set(m, opt)
@@ -252,10 +530,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			pacer.MaxSleep(maxSleep),
 			pacer.DecayConstant(2),
 		)),
-		tokenMu:        new(sync.Mutex),
-		qpsLimits:      freeUserQPS, // default to free user limits
-		apiPacers:      make(map[string]*fs.Pacer),
-		sliceHTTPClient: &http.Client{Timeout: sliceUploadTimeout},
+		apiLimiter: new(sync.Map),
+		httpClient: fshttp.NewClient(ctx),
+		noRedirectClient: fshttp.NewClient(ctx),
+	}
+	f.noRedirectClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
 	}
 
 	f.features = (&fs.Features{
@@ -263,38 +543,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		CaseInsensitive:         false,
 	}).Fill(ctx, f)
 
-	// Initialize HTTP client
-	client := fshttp.NewClient(ctx)
-	f.srv = rest.NewClient(client).SetRoot(apiBaseURL)
-	f.srv.SetHeader("Platform", "open_platform")
-	f.srv.SetHeader("Content-Type", "application/json")
+	f.srv = rest.NewClient(f.httpClient)
 
-	// Load saved token expiry
-	if opt.TokenExpiry != "" {
-		if expiry, err := time.Parse(time.RFC3339, opt.TokenExpiry); err == nil {
-			f.tokenExpiry = expiry
-		}
-	}
-
-	// Get or refresh access token
-	if err := f.getAccessToken(ctx); err != nil {
+	token, err := f.signIn(ctx)
+	if err != nil {
 		return nil, fmt.Errorf("failed to authenticate: %w", err)
 	}
+	f.accessToken = token
 
-	// Initialize user level and QPS limits
-	// Force refresh if token was just refreshed (VIP status may have changed)
-	if err := f.initUserLevel(ctx, f.tokenJustRefresh); err != nil {
-		fs.Debugf(f, "Could not refresh user info: %v", err)
-	}
-	f.tokenJustRefresh = false // Reset the flag
-
-	// Initialize directory cache (root ID is "0")
 	f.dirCache = dircache.New(root, rootID, f)
 
-	// Find the current root
 	err = f.dirCache.FindRoot(ctx, false)
 	if err != nil {
-		// Assume it is a file
 		newRoot, remote := dircache.SplitPath(root)
 		tempF := *f
 		tempF.dirCache = dircache.New(newRoot, rootID, &tempF)
@@ -302,14 +562,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 		err = tempF.dirCache.FindRoot(ctx, false)
 		if err != nil {
-			// No root so return old f
 			return f, nil
 		}
 
 		_, err := tempF.NewObject(ctx, remote)
 		if err != nil {
 			if err == fs.ErrorObjectNotFound {
-				// File doesn't exist so return old f
 				return f, nil
 			}
 			return nil, err
@@ -323,27 +581,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-// forEachFile iterates over all files in a directory, calling fn for each file.
-// If fn returns true, the iteration stops early.
-// Files are streamed directly from API pages to avoid accumulating all files in memory.
-func (f *Fs) forEachFile(ctx context.Context, parentID int64, fn func(file api.File) (stop bool)) error {
-	lastFileID := int64(0)
-	for lastFileID != -1 {
-		resp, err := f.listFiles(ctx, parentID, 100, lastFileID)
-		if err != nil {
-			return err
-		}
-		for _, file := range resp.Data.FileList {
-			if fn(file) {
-				return nil
-			}
-		}
-		lastFileID = resp.Data.LastFileID
-	}
-	return nil
-}
-
-// FindLeaf finds a directory of name leaf in the folder with ID pathID
+// FindLeaf finds a directory by name
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut string, found bool, err error) {
 	parentID, err := parseID(pathID)
 	if err != nil {
@@ -351,8 +589,8 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 	}
 
 	err = f.forEachFile(ctx, parentID, func(file api.File) bool {
-		standardName := f.opt.Enc.ToStandardName(file.Filename)
-		if file.Trashed == 0 && standardName == leaf && file.Type == 1 {
+		standardName := f.opt.Enc.ToStandardName(file.FileName)
+		if standardName == leaf && file.Type == 1 {
 			pathIDOut = formatID(file.FileID)
 			found = true
 			return true
@@ -363,22 +601,21 @@ func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (pathIDOut strin
 	return pathIDOut, found, err
 }
 
-// CreateDir makes a directory with pathID as parent and name leaf
+// CreateDir makes a directory
 func (f *Fs) CreateDir(ctx context.Context, pathID, leaf string) (newID string, err error) {
 	parentID, err := parseID(pathID)
 	if err != nil {
 		return "", err
 	}
 
-	resp, err := f.mkdir(ctx, parentID, f.opt.Enc.FromStandardName(leaf))
+	fileID, err := f.mkdir(ctx, parentID, f.opt.Enc.FromStandardName(leaf))
 	if err != nil {
 		return "", err
 	}
 
-	return formatID(resp.Data.DirID), nil
+	return formatID(fileID), nil
 }
 
-// List the objects and directories in dir into entries
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
@@ -391,30 +628,23 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 
 	err = f.forEachFile(ctx, parentID, func(file api.File) bool {
-		// Skip trashed files
-		if file.Trashed != 0 {
-			return false
-		}
-
-		remote := path.Join(dir, f.opt.Enc.ToStandardName(file.Filename))
+		remote := path.Join(dir, f.opt.Enc.ToStandardName(file.FileName))
 
 		if file.Type == 1 {
-			// Directory
-			modTime := parseTime(file.UpdateAt)
-			d := fs.NewDir(remote, modTime).SetID(formatID(file.FileID))
+			d := fs.NewDir(remote, file.UpdateAt).SetID(formatID(file.FileID))
 			entries = append(entries, d)
 			f.dirCache.Put(remote, formatID(file.FileID))
 		} else {
-			// File
 			o := &Object{
 				fs:          f,
 				remote:      remote,
 				hasMetaData: true,
 				size:        file.Size,
-				modTime:     parseTime(file.UpdateAt),
+				modTime:     file.UpdateAt,
 				id:          file.FileID,
 				etag:        file.Etag,
-				parentID:    file.ParentFileID,
+				s3KeyFlag:   file.S3KeyFlag,
+				parentID:    parentID,
 			}
 			entries = append(entries, o)
 		}
@@ -424,15 +654,15 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	return entries, err
 }
 
-// NewObject finds the Object at remote. If it can't be found it returns fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
-	return f.newObjectWithInfo(ctx, remote, nil)
+	return f.newObjectWithInfo(ctx, remote, nil, 0)
 }
 
-func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.File) (fs.Object, error) {
+func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.File, parentID int64) (fs.Object, error) {
 	o := &Object{
-		fs:     f,
-		remote: remote,
+		fs:       f,
+		remote:   remote,
+		parentID: parentID,
 	}
 
 	if info != nil {
@@ -447,21 +677,18 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *api.Fil
 	return o, nil
 }
 
-// Put uploads the object
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	existingObj, err := f.NewObject(ctx, src.Remote())
 	switch err {
 	case nil:
 		return existingObj, existingObj.Update(ctx, in, src, options...)
 	case fs.ErrorObjectNotFound:
-		// Not found so create it
 		return f.PutUnchecked(ctx, in, src, options...)
 	default:
 		return nil, err
 	}
 }
 
-// PutUnchecked uploads the object without checking for existing object
 func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	remote := src.Remote()
 	size := src.Size()
@@ -473,7 +700,6 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		return nil, fs.ErrorCantUploadEmptyFiles
 	}
 
-	// Find or create parent directory
 	leaf, directoryID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, err
@@ -484,22 +710,19 @@ func (f *Fs) PutUnchecked(ctx context.Context, in io.Reader, src fs.ObjectInfo, 
 		return nil, err
 	}
 
-	// Upload the file
 	info, err := f.upload(ctx, in, parentID, f.opt.Enc.FromStandardName(leaf), size, options...)
 	if err != nil {
 		return nil, err
 	}
 
-	return f.newObjectWithInfo(ctx, remote, info)
+	return f.newObjectWithInfo(ctx, remote, info, parentID)
 }
 
-// Mkdir creates the container if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	_, err := f.dirCache.FindDir(ctx, dir, true)
 	return err
 }
 
-// Rmdir deletes the root folder
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
@@ -511,39 +734,19 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return err
 	}
 
-	// Check if directory is empty with retries for eventual consistency
-	// 123pan has eventual consistency, so we need to retry a few times
-	// to ensure we don't delete a non-empty directory
-	const maxRetries = 3
-	for retry := 0; retry < maxRetries; retry++ {
-		resp, err := f.listFiles(ctx, folderID, 100, 0)
-		if err != nil {
-			return err
-		}
-
-		// Check for non-trashed files
-		for _, file := range resp.Data.FileList {
-			if file.Trashed == 0 {
-				return fs.ErrorDirectoryNotEmpty
-			}
-		}
-
-		// If we got some results (even if all trashed), we can trust the API response
-		if len(resp.Data.FileList) > 0 {
-			break
-		}
-
-		// If empty response and not last retry, wait and try again
-		// This handles eventual consistency where files might not be visible yet
-		if retry < maxRetries-1 {
-			fs.Debugf(f, "Rmdir: empty response, retrying %d/%d for eventual consistency", retry+1, maxRetries)
-			time.Sleep(time.Second * time.Duration(retry+1))
-		}
+	var hasContent bool
+	err = f.forEachFile(ctx, folderID, func(file api.File) bool {
+		hasContent = true
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if hasContent {
+		return fs.ErrorDirectoryNotEmpty
 	}
 
-	// Delete the directory
-	err = f.trash(ctx, folderID)
-	if err != nil {
+	if err := f.trashSingle(ctx, folderID); err != nil {
 		return err
 	}
 
@@ -551,7 +754,6 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	return nil
 }
 
-// Move src to this remote using server side move operations
 func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	srcObj, ok := src.(*Object)
 	if !ok {
@@ -559,7 +761,6 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, fs.ErrorCantMove
 	}
 
-	// Find destination directory
 	dstLeaf, dstDirectoryID, err := f.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
 		return nil, err
@@ -572,14 +773,12 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	srcLeaf := path.Base(srcObj.remote)
 
-	// Move to different directory if needed
 	if srcObj.parentID != dstParentID {
 		if err = f.move(ctx, srcObj.id, dstParentID); err != nil {
 			return nil, err
 		}
 	}
 
-	// Rename if needed
 	if srcLeaf != dstLeaf {
 		if err = f.rename(ctx, srcObj.id, f.opt.Enc.FromStandardName(dstLeaf)); err != nil {
 			return nil, err
@@ -598,133 +797,10 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	}, nil
 }
 
-// Copy src to this remote using server side copy operations (via instant upload)
-func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	srcObj, ok := src.(*Object)
-	if !ok {
-		fs.Debugf(src, "Can't copy - not same remote type")
-		return nil, fs.ErrorCantCopy
-	}
-
-	// Find destination directory
-	dstLeaf, dstDirectoryID, err := f.dirCache.FindPath(ctx, remote, true)
-	if err != nil {
-		return nil, err
-	}
-
-	dstParentID, err := parseID(dstDirectoryID)
-	if err != nil {
-		return nil, err
-	}
-
-	// Try instant upload (秒传) using the same etag
-	createResp, err := f.createFile(ctx, dstParentID, f.opt.Enc.FromStandardName(dstLeaf), srcObj.etag, srcObj.size)
-	if err != nil {
-		return nil, err
-	}
-
-	// Only works if instant upload succeeded
-	if !createResp.Data.Reuse || createResp.Data.FileID == 0 {
-		return nil, fs.ErrorCantCopy
-	}
-
-	return &Object{
-		fs:          f,
-		remote:      remote,
-		hasMetaData: true,
-		size:        srcObj.size,
-		modTime:     time.Now(),
-		id:          createResp.Data.FileID,
-		etag:        srcObj.etag,
-		parentID:    dstParentID,
-	}, nil
-}
-
-// About returns info about the 123pan account
-func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
-	info, err := f.getUserInfo(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	total := info.Data.SpacePermanent + info.Data.SpaceTemp
-	used := info.Data.SpaceUsed
-	free := total - used
-
-	return &fs.Usage{
-		Total: fs.NewUsageValue(total),
-		Used:  fs.NewUsageValue(used),
-		Free:  fs.NewUsageValue(free),
-	}, nil
-}
-
-// PublicLink generates a public link to the remote path
-func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
-	// unlink is not supported - 123pan doesn't have an API to remove share links by file
-	if unlink {
-		return "", fs.ErrorNotImplemented
-	}
-
-	// Find the object
-	o, err := f.NewObject(ctx, remote)
-	if err != nil {
-		// Try as directory
-		dirID, err := f.dirCache.FindDir(ctx, remote, false)
-		if err != nil {
-			return "", err
-		}
-		dirIDInt, err := parseID(dirID)
-		if err != nil {
-			return "", err
-		}
-		// Create share for directory
-		return f.createShareLink(ctx, dirIDInt, path.Base(remote), expire)
-	}
-
-	// Create share for file
-	obj := o.(*Object)
-	return f.createShareLink(ctx, obj.id, path.Base(remote), expire)
-}
-
-// createShareLink creates a share link and returns the URL
-func (f *Fs) createShareLink(ctx context.Context, fileID int64, name string, expire fs.Duration) (string, error) {
-	// Convert expire duration to days
-	// 123pan only supports: 1, 7, 30, or 0 (permanent)
-	expireDays := 0 // default to permanent
-	if expire > 0 {
-		days := int(time.Duration(expire) / (24 * time.Hour))
-		switch {
-		case days <= 1:
-			expireDays = 1
-		case days <= 7:
-			expireDays = 7
-		case days <= 30:
-			expireDays = 30
-		default:
-			expireDays = 0 // permanent for > 30 days
-		}
-	}
-
-	resp, err := f.createShare(ctx, fileID, name, expireDays)
-	if err != nil {
-		return "", err
-	}
-
-	return "https://www.123pan.com/s/" + resp.Data.ShareKey, nil
-}
-
-// Purge deletes all the files and directories in dir
-//
-// 123pan's trash API can delete directories including their contents.
-// If that fails, we fall back to batch deletion for efficiency.
 func (f *Fs) Purge(ctx context.Context, dir string) error {
 	return f.purgeCheck(ctx, dir, false)
 }
 
-// purgeCheck removes the directory, if check is set then it
-// refuses to do so if it has anything in (for Rmdir).
-// Uses iterative stack-based traversal with batch deletion to avoid
-// collecting all file IDs in memory at once.
 func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	directoryID, err := f.dirCache.FindDir(ctx, dir, false)
 	if err != nil {
@@ -739,11 +815,8 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	if check {
 		var hasContent bool
 		err = f.forEachFile(ctx, dirID, func(file api.File) bool {
-			if file.Trashed == 0 {
-				hasContent = true
-				return true
-			}
-			return false
+			hasContent = true
+			return true
 		})
 		if err != nil {
 			return err
@@ -753,18 +826,12 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 		}
 	}
 
-	// 123pan's trash API doesn't reliably support recursive delete.
-	// Use iterative post-order traversal with batch deletion to avoid
-	// unbounded memory from recursive ID collection.
-	// We collect IDs to batch-delete for API efficiency (trashBatchSize per call),
-	// but flush batches frequently to bound memory.
 	if err := f.deleteTree(ctx, dirID); err != nil {
 		return fmt.Errorf("Purge: failed to delete contents: %w", err)
 	}
 
-	// Delete the directory itself (unless it's the true root)
 	if directoryID != rootID {
-		if err := f.trash(ctx, dirID); err != nil {
+		if err := f.trashSingle(ctx, dirID); err != nil {
 			return fmt.Errorf("Purge: failed to delete directory: %w", err)
 		}
 	}
@@ -773,9 +840,6 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	return nil
 }
 
-// deleteTree iteratively deletes the entire file tree under rootID.
-// Uses a queue for directory traversal and flushes deletion batches
-// frequently to bound memory.
 func (f *Fs) deleteTree(ctx context.Context, rootID int64) error {
 	type bfsEntry struct{ id int64 }
 	var dirs []bfsEntry
@@ -798,9 +862,6 @@ func (f *Fs) deleteTree(ctx context.Context, rootID int64) error {
 		queue = queue[1:]
 
 		err := f.forEachFile(ctx, current.id, func(file api.File) bool {
-			if file.Trashed != 0 {
-				return false
-			}
 			if file.Type == 1 {
 				queue = append(queue, bfsEntry{id: file.FileID})
 				dirs = append(dirs, bfsEntry{id: file.FileID})
@@ -822,9 +883,8 @@ func (f *Fs) deleteTree(ctx context.Context, rootID int64) error {
 		return batchErr
 	}
 
-	// Delete directories in reverse order (deepest first)
 	for i := len(dirs) - 1; i >= 0; i-- {
-		if err := f.trash(ctx, dirs[i].id); err != nil {
+		if err := f.trashSingle(ctx, dirs[i].id); err != nil {
 			return err
 		}
 	}
@@ -832,76 +892,48 @@ func (f *Fs) deleteTree(ctx context.Context, rootID int64) error {
 	return nil
 }
 
-// CleanUp empties the trash by permanently deleting all trashed files.
-// Uses iterative BFS traversal with batch deletion to bound memory.
 func (f *Fs) CleanUp(ctx context.Context) error {
-	batch := make([]int64, 0, trashBatchSize)
-	totalDeleted := 0
-	var batchErr error
-
-	flushBatch := func() {
-		if batchErr != nil || len(batch) == 0 {
-			return
-		}
-		if err := f.deletePermanently(ctx, batch); err != nil {
-			batchErr = err
-		}
-		totalDeleted += len(batch)
-		batch = batch[:0]
-	}
-
-	type bfsEntry struct{ id int64 }
-	queue := []bfsEntry{{id: 0}} // 0 = root
-
-	for len(queue) > 0 && batchErr == nil {
-		current := queue[0]
-		queue = queue[1:]
-
-		err := f.forEachFile(ctx, current.id, func(file api.File) bool {
-			if file.Trashed != 0 {
-				batch = append(batch, file.FileID)
-				if len(batch) >= trashBatchSize {
-					flushBatch()
-				}
-			}
-			if file.Type == 1 {
-				queue = append(queue, bfsEntry{id: file.FileID})
-			}
-			return batchErr != nil
-		})
-		if err != nil {
-			return err
-		}
-		flushBatch()
-	}
-
-	if batchErr != nil {
-		return fmt.Errorf("CleanUp: batch delete failed: %w", batchErr)
-	}
-
-	if totalDeleted > 0 {
-		fs.Infof(f, "CleanUp: permanently deleted %d trashed files", totalDeleted)
-	} else {
-		fs.Debugf(f, "CleanUp: no trashed files found")
-	}
+	fs.Debugf(f, "CleanUp: not supported by Web API")
 	return nil
+}
+
+func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
+	info, err := f.userInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	total := info.Data.SpacePermanent + info.Data.SpaceTemp
+	used := info.Data.SpaceUsed
+	free := total - used
+
+	return &fs.Usage{
+		Total: fs.NewUsageValue(total),
+		Used:  fs.NewUsageValue(used),
+		Free:  fs.NewUsageValue(free),
+	}, nil
+}
+
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	return nil, fs.ErrorCantCopy
+}
+
+func (f *Fs) PublicLink(ctx context.Context, remote string, expire fs.Duration, unlink bool) (string, error) {
+	return "", fs.ErrorNotImplemented
 }
 
 // ------------------------------------------------------------
 // Object interface methods
 // ------------------------------------------------------------
 
-// Fs returns the parent Fs
 func (o *Object) Fs() fs.Info {
 	return o.fs
 }
 
-// Remote returns the remote path
 func (o *Object) Remote() string {
 	return o.remote
 }
 
-// String returns a string representation
 func (o *Object) String() string {
 	if o == nil {
 		return "<nil>"
@@ -909,27 +941,22 @@ func (o *Object) String() string {
 	return o.remote
 }
 
-// Size returns the size of the object
 func (o *Object) Size() int64 {
 	return o.size
 }
 
-// ModTime returns the modification time of the object
 func (o *Object) ModTime(ctx context.Context) time.Time {
 	return o.modTime
 }
 
-// SetModTime sets the modification time (not supported)
 func (o *Object) SetModTime(ctx context.Context, t time.Time) error {
 	return fs.ErrorCantSetModTime
 }
 
-// Storable returns whether object is storable
 func (o *Object) Storable() bool {
 	return true
 }
 
-// Hash returns the MD5 hash
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
@@ -937,41 +964,90 @@ func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
 	return o.etag, nil
 }
 
-// ID returns the object ID
 func (o *Object) ID() string {
 	return formatID(o.id)
 }
 
-// Open opens the Object for reading
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadCloser, error) {
 	fs.FixRangeOption(options, o.size)
 
-	// Get download URL
-	resp, err := o.fs.getDownloadInfo(ctx, o.id)
+	resp, err := o.fs.downloadInfo(ctx, o.id, o.etag, o.s3KeyFlag, path.Base(o.remote), o.size, 0)
 	if err != nil {
 		return nil, err
 	}
 
-	// Make HTTP request to download URL
-	opts := rest.Opts{
-		Method:  "GET",
-		RootURL: resp.Data.DownloadURL,
-		Options: options,
+	rawURL := resp.Data.DownloadURL
+
+	// Parse URL and handle base64-encoded params (123pan redirect mechanism)
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	finalURL := rawURL
+	params := u.Query().Get("params")
+	if params != "" {
+		decoded, dErr := base64.StdEncoding.DecodeString(params)
+		if dErr == nil {
+			decodedURL := strings.TrimSpace(string(decoded))
+			if strings.HasPrefix(decodedURL, "http") {
+				finalURL = decodedURL
+			}
+		}
 	}
 
+	// Follow redirect to get actual download URL, with Referer header
 	var httpResp *http.Response
 	err = o.fs.pacer.Call(func() (bool, error) {
-		httpResp, err = o.fs.srv.Call(ctx, &opts)
-		return shouldRetry(ctx, httpResp, err)
+		var reqErr error
+		req, reqErr := http.NewRequestWithContext(ctx, "GET", finalURL, nil)
+		if reqErr != nil {
+			return false, reqErr
+		}
+		req.Header.Set("Referer", "https://www.123pan.com/")
+		httpResp, reqErr = o.fs.noRedirectClient.Do(req)
+		return shouldRetry(ctx, httpResp, reqErr)
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	// Handle 302 redirect
+	if httpResp.StatusCode == http.StatusFound || httpResp.StatusCode == http.StatusMovedPermanently {
+		location := httpResp.Header.Get("Location")
+		httpResp.Body.Close()
+		if location == "" {
+			return nil, fmt.Errorf("redirect with no Location header")
+		}
+
+		httpResp, err = o.fs.httpClient.Get(location)
+		if err != nil {
+			return nil, err
+		}
+	} else if httpResp.StatusCode < 300 {
+		// Status 200 OK: may contain JSON with redirect_url
+		body, _ := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		if len(body) > 0 {
+			redirectURL := api.ExtractRedirectURL(body)
+			if redirectURL != "" {
+				httpResp, err = o.fs.httpClient.Get(redirectURL)
+				if err != nil {
+					return nil, err
+				}
+				return httpResp.Body, nil
+			}
+		}
+		// No redirect_url found, return body directly
+		return io.NopCloser(bytes.NewReader(body)), nil
+	} else {
+		body, _ := io.ReadAll(httpResp.Body)
+		httpResp.Body.Close()
+		return nil, fmt.Errorf("download failed: status %d: %s", httpResp.StatusCode, string(body))
+	}
+
 	return httpResp.Body, nil
 }
 
-// Update updates the object with the contents of the io.Reader
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	size := src.Size()
 	if size < 0 {
@@ -981,37 +1057,32 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return fs.ErrorCantUploadEmptyFiles
 	}
 
-	// Upload new content
 	info, err := o.fs.upload(ctx, in, o.parentID, o.fs.opt.Enc.FromStandardName(path.Base(o.remote)), size, options...)
 	if err != nil {
 		return err
 	}
 
-	// Delete old file if ID changed
 	if info.FileID != o.id {
-		_ = o.fs.trash(ctx, o.id)
+		_ = o.fs.trashSingle(ctx, o.id)
 	}
 
 	o.setMetaData(info)
 	return nil
 }
 
-// Remove deletes the object
 func (o *Object) Remove(ctx context.Context) error {
-	return o.fs.trash(ctx, o.id)
+	return o.fs.trashSingle(ctx, o.id)
 }
 
-// setMetaData sets the metadata from api.File
 func (o *Object) setMetaData(info *api.File) {
 	o.hasMetaData = true
 	o.size = info.Size
-	o.modTime = parseTime(info.UpdateAt)
+	o.modTime = info.UpdateAt
 	o.id = info.FileID
 	o.etag = info.Etag
-	o.parentID = info.ParentFileID
+	o.s3KeyFlag = info.S3KeyFlag
 }
 
-// readMetaData reads metadata from the server
 func (o *Object) readMetaData(ctx context.Context) error {
 	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, o.remote, false)
 	if err != nil {
@@ -1028,9 +1099,10 @@ func (o *Object) readMetaData(ctx context.Context) error {
 
 	var found bool
 	err = o.fs.forEachFile(ctx, parentID, func(file api.File) bool {
-		standardName := o.fs.opt.Enc.ToStandardName(file.Filename)
-		if file.Trashed == 0 && standardName == leaf && file.Type == 0 {
+		standardName := o.fs.opt.Enc.ToStandardName(file.FileName)
+		if standardName == leaf && file.Type == 0 {
 			o.setMetaData(&file)
+			o.parentID = parentID
 			found = true
 			return true
 		}
@@ -1039,34 +1111,49 @@ func (o *Object) readMetaData(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
 	if !found {
 		return fs.ErrorObjectNotFound
 	}
 	return nil
 }
 
-// parseTime parses time from 123pan format
-func parseTime(timeStr string) time.Time {
-	// Format: "2006-01-02 15:04:05" in UTC+8
-	loc := time.FixedZone("UTC+8", 8*60*60)
-	t, err := time.ParseInLocation("2006-01-02 15:04:05", timeStr, loc)
-	if err != nil {
-		return time.Now()
-	}
-	return t
+// ------------------------------------------------------------
+// Retry logic
+// ------------------------------------------------------------
+
+var retryErrorCodes = []int{
+	429,
+	500,
+	502,
+	503,
+	504,
 }
 
-// Check the interfaces are satisfied
+func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, error) {
+	if err != nil {
+		return false, err
+	}
+	if resp == nil {
+		return false, nil
+	}
+	for _, code := range retryErrorCodes {
+		if resp.StatusCode == code {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// ------------------------------------------------------------
+// Interface checks
+// ------------------------------------------------------------
+
 var (
 	_ fs.Fs              = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
-	_ fs.Copier          = (*Fs)(nil)
 	_ fs.Abouter         = (*Fs)(nil)
 	_ fs.PutUncheckeder  = (*Fs)(nil)
-	_ fs.PublicLinker    = (*Fs)(nil)
 	_ fs.Purger          = (*Fs)(nil)
-	_ fs.CleanUpper      = (*Fs)(nil)
 	_ dircache.DirCacher = (*Fs)(nil)
 	_ fs.Object          = (*Object)(nil)
 	_ fs.IDer            = (*Object)(nil)
