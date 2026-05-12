@@ -18,115 +18,224 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-            asset_name: rclone-linux-amd64
-
-          - os: macos-latest
-            goos: darwin
-            goarch: amd64
-            asset_name: rclone-macos-amd64
-
-          - os: macos-latest
-            goos: darwin
-            goarch: arm64
-            asset_name: rclone-macos-arm64
-
-          - os: windows-latest
-            goos: windows
-            goarch: amd64
-            ext: .exe
-            asset_name: rclone-windows-amd64
-
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-
+  # ── Linux (all non-macOS/non-Windows platforms) ──
+  build-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Setup Go
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6
         with:
           go-version: '~1.26.3'
           check-latest: true
 
+      - name: Install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3 libfuse-dev rpm
+
       - name: Set version
-        id: version
-        shell: bash
+        id: ver
         run: |
-          UPSTREAM_VER=$(cat VERSION)
-          COMMIT_HASH=$(git rev-parse --short=8 HEAD)
-          FULL_VER="${UPSTREAM_VER}-${COMMIT_HASH}"
-          echo "full_version=${FULL_VER}" >> $GITHUB_OUTPUT
-          echo "upstream_version=${UPSTREAM_VER}" >> $GITHUB_OUTPUT
+          UPSTREAM=$(cat VERSION)
+          HASH=$(git rev-parse --short=8 HEAD)
+          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_OUTPUT
 
-      - name: Build
-        shell: bash
+      - name: Build Linux platforms
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -trimpath -ldflags="-s -w -X github.com/rclone/rclone/fs.Version=${{ steps.version.outputs.full_version }}" \
-            -o ${{ matrix.asset_name }}${{ matrix.ext }} .
+          go run bin/cross-compile.go \
+            -release "${{ steps.ver.outputs.full }}" \
+            -include '^linux/' \
+            -exclude '^(linux/386|linux/arm|linux/mips|linux/mipsle|linux/arm-v6|linux/arm-v7)$' \
+            -tags cmount \
+            -no-clean \
+            "${{ steps.ver.outputs.full }}"
 
-      - name: Upload artifact
+      - name: Build Linux 386
+        run: |
+          GOARCH=386 go run bin/cross-compile.go \
+            -release "${{ steps.ver.outputs.full }}" \
+            -include '^linux/386$' \
+            -tags cmount \
+            -no-clean \
+            "${{ steps.ver.outputs.full }}"
+
+      - name: Build Linux ARM variants
+        run: |
+          go run bin/cross-compile.go \
+            -release "${{ steps.ver.outputs.full }}" \
+            -include '^linux/(arm|mips|mipsle)' \
+            -no-clean \
+            "${{ steps.ver.outputs.full }}"
+
+      - name: Build FreeBSD / NetBSD / OpenBSD / Plan9 / Solaris / AIX
+        run: |
+          go run bin/cross-compile.go \
+            -release "${{ steps.ver.outputs.full }}" \
+            -exclude '^(windows/|darwin/|linux/)' \
+            -compile-only \
+            -no-clean \
+            "${{ steps.ver.outputs.full }}"
+
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}${{ matrix.ext }}
-          if-no-files-found: error
+          name: binaries-linux
+          path: build/*
           retention-days: 7
 
+  # ── macOS (needs native cgo + macFUSE) ──
+  build-macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job: amd64
+            goarch: amd64
+            build_flags: '-include "^darwin/amd64" -cgo'
+          - job: arm64
+            goarch: arm64
+            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64'
+
+    name: macOS ${{ matrix.job }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '~1.26.3'
+          check-latest: true
+
+      - name: Install macFUSE
+        run: |
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core
+          brew untap --force homebrew/cask
+          brew update
+          brew install --cask macfuse
+
+      - name: Set version
+        id: ver
+        run: |
+          UPSTREAM=$(cat VERSION)
+          HASH=$(git rev-parse --short=8 HEAD)
+          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_OUTPUT
+
+      - name: Build
+        run: |
+          go run bin/cross-compile.go \
+            -release "${{ steps.ver.outputs.full }}" \
+            ${{ matrix.build_flags }} \
+            -tags cmount \
+            -no-clean \
+            "${{ steps.ver.outputs.full }}"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-macos-${{ matrix.job }}
+          path: build/*
+          retention-days: 7
+
+  # ── Windows (needs native cgo + WinFsp) ──
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '~1.26.3'
+          check-latest: true
+
+      - name: Install WinFsp and zip
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          choco install -y winfsp zip
+          echo "CPATH=C:\Program Files\WinFsp\inc\fuse;C:\Program Files (x86)\WinFsp\inc\fuse" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Set version
+        id: ver
+        run: |
+          UPSTREAM=$(cat VERSION)
+          HASH=$(git rev-parse --short=8 HEAD)
+          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_ENV
+
+      - name: Build Windows
+        run: |
+          go run bin/cross-compile.go `
+            -release "${{ steps.ver.outputs.full }}" `
+            -include '^windows/' `
+            -tags cmount `
+            -no-clean `
+            "${{ steps.ver.outputs.full }}"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: binaries-windows
+          path: build/*
+          retention-days: 7
+
+  # ── Release ──
   release:
-    needs: build
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/master'
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
 
       - name: Set version
-        id: version
+        id: ver
         run: |
-          UPSTREAM_VER=$(cat VERSION)
-          COMMIT_HASH=$(git rev-parse --short=8 HEAD)
-          FULL_VER="${UPSTREAM_VER}-${COMMIT_HASH}"
-          echo "full_version=${FULL_VER}" >> $GITHUB_OUTPUT
-          echo "upstream_version=${UPSTREAM_VER}" >> $GITHUB_OUTPUT
+          UPSTREAM=$(cat VERSION)
+          HASH=$(git rev-parse --short=8 HEAD)
+          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_OUTPUT
+          echo "upstream=${UPSTREAM}" >> $GITHUB_OUTPUT
 
       - name: Download all artifacts
         uses: actions/download-artifact@v7
         with:
-          path: artifacts
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: List release files
+        run: |
+          echo "Files to release:"
+          find release-artifacts -type f | sort
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.full_version }}
-          name: ${{ steps.version.outputs.full_version }}
+          tag_name: ${{ steps.ver.outputs.full }}
+          name: ${{ steps.ver.outputs.full }}
           body: |
-            ## Rclone with 123Pan ${{ steps.version.outputs.full_version }}
+            ## Rclone with 123Pan ${{ steps.ver.outputs.full }}
 
-            基于上游版本 `${{ steps.version.outputs.upstream_version }}`，包含以下增强：
+            **上游版本**: `${{ steps.ver.outputs.upstream }}`
+            **构建 commit**: `${{ github.sha }}`
 
-            - **123pan**: Web/浏览器 API 后端（用户名密码登录）
-            - **123open**: 官方 Open API 后端（开发者凭证）
+            ### 新增功能
+            - **123pan**: Web/浏览器 API 后端（用户名密码登录，无需开发者凭证）
+            - **123open**: 官方 Open API 后端（OAuth2 Client Credentials）
 
-            构建自 commit: `${{ github.sha }}`
+            ### 支持的平台
+            Linux (amd64/386/arm/arm64/mips/mipsle) · macOS (amd64/arm64) · Windows (386/amd64/arm64) · FreeBSD · NetBSD · OpenBSD · Plan9 · Solaris · AIX
           draft: false
           prerelease: false
           files: |
-            artifacts/rclone-linux-amd64/rclone-linux-amd64
-            artifacts/rclone-macos-amd64/rclone-macos-amd64
-            artifacts/rclone-macos-arm64/rclone-macos-arm64
-            artifacts/rclone-windows-amd64/rclone-windows-amd64.exe
+            release-artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
