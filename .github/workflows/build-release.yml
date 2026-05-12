@@ -18,7 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  # ── Linux: amd64/386/arm/arm64/mips/mipsle + BSDs + Solaris + Plan9 + AIX ──
+  # ── Linux: amd64/386/arm/arm64/mips/mipsle ──
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -31,6 +31,14 @@ jobs:
         with:
           go-version: '~1.26.3'
           check-latest: true
+          cache: true
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-build-
 
       - name: Install libraries
         run: |
@@ -82,6 +90,14 @@ jobs:
         with:
           go-version: '~1.26.3'
           check-latest: true
+          cache: true
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~/Library/Caches/go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-build-
 
       - name: Install macFUSE
         run: |
@@ -125,6 +141,14 @@ jobs:
         with:
           go-version: '~1.26.3'
           check-latest: true
+          cache: true
+
+      - name: Cache Go build cache
+        uses: actions/cache@v5
+        with:
+          path: ~\AppData\Local\go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('go.sum') }}
+          restore-keys: ${{ runner.os }}-go-build-
 
       - name: Install WinFsp and zip
         run: |
