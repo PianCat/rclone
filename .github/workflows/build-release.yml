@@ -18,7 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  # ── Linux (all non-macOS/non-Windows platforms) ──
+  # ── Linux: amd64/386/arm/arm64/mips/mipsle + BSDs + Solaris + Plan9 + AIX ──
   build-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -44,40 +44,19 @@ jobs:
           HASH=$(git rev-parse --short=8 HEAD)
           echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_OUTPUT
 
-      - name: Build Linux platforms
+      - name: Build all Linux platforms (with cmount)
         run: |
           go run bin/cross-compile.go \
-            -release "${{ steps.ver.outputs.full }}" \
             -include '^linux/' \
-            -exclude '^(linux/386|linux/arm|linux/mips|linux/mipsle|linux/arm-v6|linux/arm-v7)$' \
             -tags cmount \
-            -no-clean \
-            "${{ steps.ver.outputs.full }}"
-
-      - name: Build Linux 386
-        run: |
-          GOARCH=386 go run bin/cross-compile.go \
-            -release "${{ steps.ver.outputs.full }}" \
-            -include '^linux/386$' \
-            -tags cmount \
-            -no-clean \
-            "${{ steps.ver.outputs.full }}"
-
-      - name: Build Linux ARM variants
-        run: |
-          go run bin/cross-compile.go \
-            -release "${{ steps.ver.outputs.full }}" \
-            -include '^linux/(arm|mips|mipsle)' \
-            -no-clean \
             "${{ steps.ver.outputs.full }}"
 
       - name: Build FreeBSD / NetBSD / OpenBSD / Plan9 / Solaris / AIX
         run: |
           go run bin/cross-compile.go \
-            -release "${{ steps.ver.outputs.full }}" \
-            -exclude '^(windows/|darwin/|linux/)' \
-            -compile-only \
+            -include '^(freebsd|netbsd|openbsd|plan9|solaris|aix)' \
             -no-clean \
+            -compile-only \
             "${{ steps.ver.outputs.full }}"
 
       - name: Upload Linux artifacts
@@ -95,14 +74,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - job: amd64
-            goarch: amd64
-            build_flags: '-include "^darwin/amd64" -cgo'
-          - job: arm64
-            goarch: arm64
-            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64'
+          - name: amd64
+            flags: '-include "^darwin/amd64" -cgo'
+          - name: arm64
+            flags: '-include "^darwin/arm64" -cgo -macos-arch arm64'
 
-    name: macOS ${{ matrix.job }}
+    name: macOS ${{ matrix.name }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -131,16 +108,14 @@ jobs:
       - name: Build
         run: |
           go run bin/cross-compile.go \
-            -release "${{ steps.ver.outputs.full }}" \
-            ${{ matrix.build_flags }} \
+            ${{ matrix.flags }} \
             -tags cmount \
-            -no-clean \
             "${{ steps.ver.outputs.full }}"
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: binaries-macos-${{ matrix.job }}
+          name: binaries-macos-${{ matrix.name }}
           path: build/*
           retention-days: 7
 
@@ -159,26 +134,24 @@ jobs:
           check-latest: true
 
       - name: Install WinFsp and zip
-        shell: powershell
         run: |
-          $ProgressPreference = 'SilentlyContinue'
           choco install -y winfsp zip
-          echo "CPATH=C:\Program Files\WinFsp\inc\fuse;C:\Program Files (x86)\WinFsp\inc\fuse" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "CPATH=C:\Program Files\WinFsp\inc\fuse;C:\Program Files (x86)\WinFsp\inc\fuse" >> $env:GITHUB_ENV
 
       - name: Set version
         id: ver
+        shell: bash
         run: |
           UPSTREAM=$(cat VERSION)
           HASH=$(git rev-parse --short=8 HEAD)
-          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_ENV
+          echo "full=${UPSTREAM}-${HASH}" >> $GITHUB_OUTPUT
 
       - name: Build Windows
+        shell: bash
         run: |
-          go run bin/cross-compile.go `
-            -release "${{ steps.ver.outputs.full }}" `
-            -include '^windows/' `
-            -tags cmount `
-            -no-clean `
+          go run bin/cross-compile.go \
+            -include '^windows/' \
+            -tags cmount \
             "${{ steps.ver.outputs.full }}"
 
       - name: Upload Windows artifacts
@@ -197,7 +170,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set version
+      - name: Set release version
         id: ver
         run: |
           UPSTREAM=$(cat VERSION)
@@ -212,9 +185,7 @@ jobs:
           merge-multiple: true
 
       - name: List release files
-        run: |
-          echo "Files to release:"
-          find release-artifacts -type f | sort
+        run: find release-artifacts -type f | sort
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -236,6 +207,6 @@ jobs:
           draft: false
           prerelease: false
           files: |
-            release-artifacts/*
+            release-artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
