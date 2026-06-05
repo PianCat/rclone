@@ -5,6 +5,10 @@ on:
     - cron: '0 4 1 * *'  # 每周一凌晨 4:00 UTC
   workflow_dispatch:      # 允许手动触发
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -39,6 +43,15 @@ jobs:
       - name: Push if successful
         if: steps.rebase.outputs.rebase_status == 'success'
         run: git push --force-with-lease origin master
+
+      - name: Trigger Build & Release
+        if: steps.rebase.outputs.rebase_status == 'success'
+        run: |
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build-release.yml/dispatches" \
+            -d '{"ref":"master"}'
 
       - name: Report conflict
         if: steps.rebase.outputs.rebase_status == 'conflict'
